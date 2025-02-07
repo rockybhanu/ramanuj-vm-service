@@ -4,128 +4,175 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
+	"os"
 	"os/exec"
 	"text/template"
+	"time"
 
-	"github.com/libvirt/libvirt-go"
+	"github.com/google/uuid"
+	libvirt "github.com/libvirt/libvirt-go"
 )
 
-// RequestData defines the JSON structure for VM creation
+var domainXMLTemplate *template.Template
+
+// RequestData - incoming JSON to define how the VM should be created
 type RequestData struct {
-	Name       string `json:"name"`
-	ISOImage   string `json:"iso_image"`
-	MemoryMB   int    `json:"memory_mb"`
-	CPUs       int    `json:"cpus"`
-	DiskSizeGB int    `json:"disk_size_gb"`
+	Name             string `json:"name"`
+	PrebuiltDiskPath string `json:"prebuilt_disk_path,omitempty"`
+	ISOImage         string `json:"iso_image,omitempty"`
+	MemoryMB         int    `json:"memory_mb"`
+	CPUs             int    `json:"cpus"`
+	DiskSizeGB       int    `json:"disk_size_gb"`
 }
 
-// ResponseData for success or error
+// DiskDevice - represents a disk in the final domain XML
+type DiskDevice struct {
+	Dev  string // e.g., "vda", "vdb"
+	Path string // path to qcow2 on host
+}
+
+// TemplateData - all fields we inject into vm-template.xml
+type TemplateData struct {
+	Name       string
+	UUID       string
+	MemoryKiB  int
+	CPUs       int
+	MacAddress string
+
+	// Disks: a slice for one (root) + optional second
+	Disks []DiskDevice
+
+	// If user specified an ISO, we attach a CDROM
+	HasISO   bool
+	ISOImage string
+}
+
 type ResponseData struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
 }
 
-// DomainXMLTemplate is a basic XML template for KVM/libvirt domain
-// NOTE: This is a minimal example to create a VM with:
-//   - One disk (qcow2) as vda
-//   - One CD-ROM from the specified ISO
-//   - A single NIC bound to "host-only-net"
-const DomainXMLTemplate = `
-<domain type='kvm'>
-  <name>{{ .Name }}</name>
-  <memory unit='MiB'>{{ .MemoryMB }}</memory>
-  <currentMemory unit='MiB'>{{ .MemoryMB }}</currentMemory>
-  <vcpu placement='static'>{{ .CPUs }}</vcpu>
-  <os>
-    <type arch='x86_64' machine='pc'>hvm</type>
-    <boot dev='cdrom'/>
-  </os>
-  <devices>
-    <!-- CD-ROM device with provided ISO -->
-    <disk type='file' device='cdrom'>
-      <source file='{{ .ISOImage }}'/>
-      <target dev='hdc' bus='ide'/>
-      <readonly/>
-    </disk>
-    <!-- Primary disk using qcow2 -->
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
-      <source file='/var/lib/libvirt/images/{{ .Name }}.qcow2'/>
-      <target dev='vda' bus='virtio'/>
-    </disk>
-    <interface type='network'>
-      <source network='host-only-net'/>
-      <model type='virtio'/>
-    </interface>
-    <graphics type='vnc' port='-1' listen='127.0.0.1'/>
-  </devices>
-</domain>
-`
+func init() {
+	rand.Seed(time.Now().UnixNano())
 
-func main() {
-	http.HandleFunc("/api/v1/vm", handleCreateVM)
-	log.Println("ramanuj-vm-service listening on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// Load the external XML template at startup
+	content, err := os.ReadFile("vm-template.xml")
+	if err != nil {
+		log.Fatalf("Failed to read vm-template.xml: %v", err)
+	}
+	domainXMLTemplate, err = template.New("domainXML").Parse(string(content))
+	if err != nil {
+		log.Fatalf("Failed to parse vm-template.xml as template: %v", err)
 	}
 }
 
-// handleCreateVM handles the POST /api/v1/vm endpoint
+func main() {
+	http.HandleFunc("/api/v1/vm", handleCreateVM)
+	log.Println("padmini-vm-service listening on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Error starting server: %v", err)
+	}
+}
+
 func handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST is allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse the incoming JSON request
 	var req RequestData
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
-		log.Printf("Error decoding request: %v", err)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Error decoding JSON: %v", err)
 		http.Error(w, "Invalid JSON input", http.StatusBadRequest)
 		return
 	}
 
-	// Validate minimal fields
-	if req.Name == "" || req.ISOImage == "" || req.MemoryMB <= 0 || req.CPUs <= 0 || req.DiskSizeGB <= 0 {
-		log.Printf("Invalid request parameters: %+v", req)
-		http.Error(w, "Missing or invalid parameters", http.StatusBadRequest)
+	// Basic validation
+	if req.Name == "" || req.MemoryMB <= 0 || req.CPUs <= 0 {
+		msg := fmt.Sprintf("Missing/invalid request fields: %+v", req)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 
-	// STEP 1: Create the qcow2 disk image
-	diskPath := fmt.Sprintf("/var/lib/libvirt/images/%s.qcow2", req.Name)
-	diskSizeArg := fmt.Sprintf("%dG", req.DiskSizeGB)
+	// STEP 1: Build our list of disk devices
+	// (We might create or skip creation depending on user input)
 
-	// Example command: qemu-img create -f qcow2 /var/lib/libvirt/images/<VM_NAME>.qcow2 10G
-	createDiskCmd := exec.Command("qemu-img", "create", "-f", "qcow2", diskPath, diskSizeArg)
+	// We'll hold two potential disk devices: root (vda), optional data (vdb)
+	var disks []DiskDevice
 
-	if output, err := createDiskCmd.CombinedOutput(); err != nil {
-		errMsg := fmt.Sprintf("Failed to create disk image: %v, output: %s", err, string(output))
-		log.Println(errMsg)
-		writeErrorResponse(w, errMsg)
-		return
+	rootDev := "vda"
+	var rootDiskPath string
+
+	if req.PrebuiltDiskPath != "" {
+		// Use the existing qcow2 as the root disk
+		rootDiskPath = req.PrebuiltDiskPath
+		// Don't create a new file for the root disk
+		log.Printf("User provided an existing disk for root: %s", rootDiskPath)
+	} else {
+		// If the user didn't provide a prebuilt disk, create one for root
+		rootDiskPath = fmt.Sprintf("/var/lib/libvirt/images/%s.qcow2", req.Name)
+		if err := createQcow2Disk(rootDiskPath, req.DiskSizeGB); err != nil {
+			errMsg := fmt.Sprintf("Failed to create root disk: %v", err)
+			log.Println(errMsg)
+			writeErrorResponse(w, errMsg)
+			return
+		}
 	}
-	log.Printf("Disk created: %s of size %s", diskPath, diskSizeArg)
+
+	// Add root disk to the slice
+	disks = append(disks, DiskDevice{
+		Dev:  rootDev,
+		Path: rootDiskPath,
+	})
+
+	// If user wants an additional disk (req.DiskSizeGB > 0) AND they used a prebuilt root,
+	// we can create that new disk as "vdb". If they used a prebuilt root *and* gave a size,
+	// we interpret that as "I want a second data disk."
+	//
+	// BUT if they provided a prebuilt disk and also "disk_size_gb", we have to decide:
+	// do we treat the disk_size_gb as "root" or "data"?
+	// We'll interpret it as an extra data disk (since the user root is from prebuilt).
+	// If user is installing from ISO onto a new root, that also uses disk_size_gb above
+	// (already created for vda). So let's handle a potential second disk carefully:
+
+	// We'll do a simple rule:
+	// - If PrebuiltDiskPath != "" and DiskSizeGB > 0 => create a second disk as vdb.
+	// - If PrebuiltDiskPath == "" => we used DiskSizeGB for the root disk already (vda).
+	//   The user can specify a separate "data_size_gb" field if we wanted a second disk
+	//   but let's keep it simple for now. We'll assume they only do 1 disk in that scenario.
+
+	// For a more thorough approach, you might define an array of volumes or something similar in the API.
+	if req.PrebuiltDiskPath != "" && req.DiskSizeGB > 0 {
+		dataDiskPath := fmt.Sprintf("/var/lib/libvirt/images/%s-data.qcow2", req.Name)
+		if err := createQcow2Disk(dataDiskPath, req.DiskSizeGB); err != nil {
+			errMsg := fmt.Sprintf("Failed to create additional data disk: %v", err)
+			log.Println(errMsg)
+			writeErrorResponse(w, errMsg)
+			return
+		}
+
+		// Add second disk as vdb
+		disks = append(disks, DiskDevice{
+			Dev:  "vdb",
+			Path: dataDiskPath,
+		})
+	}
 
 	// STEP 2: Connect to libvirt
-	conn, err := libvirt.NewConnect("qemu:///system") // or "qemu+tcp://..."
+	conn, err := libvirt.NewConnect("qemu:///system")
 	if err != nil {
-		errMsg := fmt.Sprintf("Failed to connect to libvirt: %v", err)
+		errMsg := fmt.Sprintf("Failed to connect libvirt: %v", err)
 		log.Println(errMsg)
 		writeErrorResponse(w, errMsg)
 		return
 	}
-	defer func(conn *libvirt.Connect) {
-		_, err := conn.Close()
-		if err != nil {
+	defer conn.Close()
 
-		}
-	}(conn)
-
-	// STEP 3: Generate the domain XML from the template
-	domainXML, err := generateDomainXML(req)
+	// STEP 3: Generate domain XML
+	xmlContent, err := generateDomainXML(req, disks)
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to generate domain XML: %v", err)
 		log.Println(errMsg)
@@ -133,26 +180,20 @@ func handleCreateVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Generated domain XML for %s:\n%s\n", req.Name, domainXML)
+	log.Printf("Domain XML:\n%s\n", xmlContent)
 
-	// STEP 4: Define the domain
-	dom, err := conn.DomainDefineXML(domainXML)
+	// STEP 4: Define domain
+	dom, err := conn.DomainDefineXML(xmlContent)
 	if err != nil {
-		errMsg := fmt.Sprintf("Failed to define domain: %v", err)
+		errMsg := fmt.Sprintf("DomainDefineXML failed: %v", err)
 		log.Println(errMsg)
 		writeErrorResponse(w, errMsg)
 		return
 	}
-	defer func(dom *libvirt.Domain) {
-		err := dom.Free()
-		if err != nil {
+	defer dom.Free()
 
-		}
-	}(dom)
-
-	// STEP 5: Start (create) the domain
+	// STEP 5: Start domain
 	if err := dom.Create(); err != nil {
-		// If we fail to start, attempt to undefine the domain to clean up
 		_ = dom.Undefine()
 		errMsg := fmt.Sprintf("Failed to start domain: %v", err)
 		log.Println(errMsg)
@@ -160,58 +201,80 @@ func handleCreateVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If successful, respond with success
 	writeSuccessResponse(w, "VM created and started successfully")
 }
 
-// generateDomainXML renders the domain XML template using the request data
-func generateDomainXML(data RequestData) (string, error) {
-	tpl, err := template.New("domainXML").Parse(DomainXMLTemplate)
+// createQcow2Disk is a helper to call qemu-img create
+func createQcow2Disk(path string, sizeGB int) error {
+	if sizeGB <= 0 {
+		return fmt.Errorf("disk_size_gb must be > 0 to create a new disk")
+	}
+	sizeArg := fmt.Sprintf("%dG", sizeGB)
+	cmd := exec.Command("qemu-img", "create", "-f", "qcow2", path, sizeArg)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", err
+		return fmt.Errorf("qemu-img create failed: %v, output: %s", err, string(output))
+	}
+	log.Printf("Created disk %s (%s)", path, sizeArg)
+	return nil
+}
+
+// generateDomainXML populates the vm-template with the relevant fields
+func generateDomainXML(req RequestData, disks []DiskDevice) (string, error) {
+	data := TemplateData{
+		Name:       req.Name,
+		UUID:       uuid.New().String(),
+		MemoryKiB:  req.MemoryMB * 1024,
+		CPUs:       req.CPUs,
+		MacAddress: generateRandomMAC(),
+
+		Disks: disks,
+
+		HasISO:   (req.ISOImage != ""),
+		ISOImage: req.ISOImage,
 	}
 
 	var outStr string
-	// We’ll render into a buffer
-	err = tpl.Execute(newBuffer(&outStr), data)
-	if err != nil {
+	if err := domainXMLTemplate.Execute(newBuffer(&outStr), data); err != nil {
 		return "", err
 	}
 	return outStr, nil
 }
 
-// newBuffer is a small helper to allow template to write into a string.
+// Simple buffer to capture template output
 type stringBuffer struct {
 	str *string
 }
 
 func newBuffer(s *string) *stringBuffer {
-	return &stringBuffer{
-		str: s,
-	}
+	return &stringBuffer{str: s}
 }
+
 func (sb *stringBuffer) Write(p []byte) (n int, err error) {
 	*sb.str += string(p)
 	return len(p), nil
 }
 
-// writeSuccessResponse writes a JSON success response
-func writeSuccessResponse(w http.ResponseWriter, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	resp := ResponseData{
-		Status:  "success",
-		Message: msg,
-	}
-	json.NewEncoder(w).Encode(resp)
+// Generate a random MAC address with QEMU-friendly prefix 52:54:00
+func generateRandomMAC() string {
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x",
+		rand.Intn(256),
+		rand.Intn(256),
+		rand.Intn(256),
+	)
 }
 
-// writeErrorResponse writes a JSON error response
+// writeSuccessResponse
+func writeSuccessResponse(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	resp := ResponseData{Status: "success", Message: msg}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// writeErrorResponse
 func writeErrorResponse(w http.ResponseWriter, msg string) {
 	w.WriteHeader(http.StatusInternalServerError)
 	w.Header().Set("Content-Type", "application/json")
-	resp := ResponseData{
-		Status:  "error",
-		Message: msg,
-	}
-	json.NewEncoder(w).Encode(resp)
+	resp := ResponseData{Status: "error", Message: msg}
+	_ = json.NewEncoder(w).Encode(resp)
 }

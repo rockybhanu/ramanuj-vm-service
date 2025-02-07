@@ -1,0 +1,104 @@
+<!-- vm-template.xml -->
+<!--
+  This template supports:
+    1. A list of disk devices (root + optional extra).
+    2. An optional CD-ROM device (if .HasISO is true).
+    3. Boot order: if ISO is present, boot from cdrom first, then disk;
+       otherwise, boot from disk only.
+-->
+
+<domain type='kvm'>
+    <name>{{.Name}}</name>
+    <uuid>{{.UUID}}</uuid>
+
+    <!-- Memory in KiB -->
+    <memory unit='KiB'>{{.MemoryKiB}}</memory>
+    <currentMemory unit='KiB'>{{.MemoryKiB}}</currentMemory>
+
+    <!-- CPU cores -->
+    <vcpu placement='static'>{{.CPUs}}</vcpu>
+
+    <os>
+        <type arch='x86_64' machine='pc-q35-7.2'>hvm</type>
+
+        {{ if .HasISO }}
+        <!-- If ISO is present, boot from CD-ROM first -->
+        <boot dev='cdrom'/>
+        <boot dev='hd'/>
+        {{ else }}
+        <!-- Otherwise, just boot from disk -->
+        <boot dev='hd'/>
+        {{ end }}
+    </os>
+
+    <features>
+        <acpi/>
+        <apic/>
+        <vmport state='off'/>
+    </features>
+
+    <!-- Host-passthrough CPU, Q35 machine, typical clock & power ops -->
+    <cpu mode='host-passthrough' check='none' migratable='on'/>
+    <clock offset='utc'>
+        <timer name='rtc' tickpolicy='catchup'/>
+        <timer name='pit' tickpolicy='delay'/>
+        <timer name='hpet' present='no'/>
+    </clock>
+    <on_poweroff>destroy</on_poweroff>
+    <on_reboot>restart</on_reboot>
+    <on_crash>destroy</on_crash>
+    <pm>
+        <suspend-to-mem enabled='no'/>
+        <suspend-to-disk enabled='no'/>
+    </pm>
+
+    <devices>
+        <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+        <!-- Disks: one or more from .Disks -->
+        {{ range .Disks }}
+        <disk type='file' device='disk'>
+            <driver name='qemu' type='qcow2' discard='unmap'/>
+            <source file='{{.Path}}'/>
+            <target dev='{{.Dev}}' bus='virtio'/>
+        </disk>
+        {{ end }}
+
+        {{ if .HasISO }}
+        <!-- If user specified an ISO, attach as CD-ROM. -->
+        <disk type='file' device='cdrom'>
+            <driver name='qemu' type='raw'/>
+            <source file='{{.ISOImage}}'/>
+            <!-- We use SATA for the CD-ROM device here -->
+            <target dev='sda' bus='sata'/>
+            <readonly/>
+        </disk>
+        {{ end }}
+
+        <!-- Basic network interface with random MAC -->
+        <interface type='network'>
+            <mac address='{{.MacAddress}}'/>
+            <source network='host-only-net'/>
+            <model type='virtio'/>
+        </interface>
+
+        <!-- Serial console and Spice/VNC style graphics -->
+        <serial type='pty'>
+            <target type='isa-serial' port='0'/>
+        </serial>
+        <console type='pty'>
+            <target type='serial' port='0'/>
+        </console>
+        <graphics type='spice' autoport='yes'>
+            <listen type='address'/>
+            <image compression='off'/>
+        </graphics>
+
+        <!-- Memory balloon and RNG -->
+        <memballoon model='virtio'/>
+        <rng model='virtio'>
+            <backend model='random'>/dev/urandom</backend>
+        </rng>
+
+    </devices>
+</domain>
